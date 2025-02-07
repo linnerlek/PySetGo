@@ -1,0 +1,2 @@
+PyQT6
+psutil

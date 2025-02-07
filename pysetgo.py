@@ -4,8 +4,25 @@ import platform
 import subprocess
 import shutil
 import time
+import ctypes
+import socket
+import atexit
+import psutil
 from PyQt6 import QtWidgets, QtCore
 
+
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def is_connected():
+    try:
+        socket.create_connection(("8.8.8.8", 53), timeout=3)
+        return True
+    except OSError:
+        return False
 
 class InstallerThread(QtCore.QThread):
     update_signal = QtCore.pyqtSignal(str)
@@ -54,14 +71,12 @@ class InstallerThread(QtCore.QThread):
             self.update_signal.emit("Installing Python libraries...")
             self.update_signal.emit("--------------------")
             self.install_python_libraries()
-            self.increment_progress(30)
 
         if self.install_extensions:
             self.update_signal.emit("--------------------")
             self.update_signal.emit("Installing VS Code extensions...")
             self.update_signal.emit("--------------------")
             self.install_vscode_extensions()
-            self.increment_progress(20)
 
 
         self.update_signal.emit("--------------------")
@@ -78,17 +93,28 @@ class InstallerThread(QtCore.QThread):
 
     def execute_command(self, cmd, capture_output=True):
         try:
+            startupinfo = None
+            if platform.system() == "Windows":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW 
+            
+            if platform.system() != "Windows":
+                cmd.insert(0, "sudo")  
+
             result = subprocess.run(
                 cmd,
-                stdout=subprocess.PIPE if capture_output else None,
-                stderr=subprocess.PIPE if capture_output else None,
+                stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+                stderr=subprocess.PIPE if capture_output else subprocess.DEVNULL,
                 text=True,
                 check=True,
-                stdin=subprocess.DEVNULL
+                stdin=subprocess.PIPE if platform.system() != "Windows" else subprocess.DEVNULL,
+                input=f"{self.password}\n" if platform.system() != "Windows" else None,
+                startupinfo=startupinfo 
             )
             return result.stdout.strip() if capture_output and result.stdout else None
         except subprocess.CalledProcessError as e:
             return f"Error: {e.stderr.strip()}" if capture_output else None
+
 
     def get_command_path(self, command):
         result = shutil.which(command)
@@ -138,17 +164,28 @@ class InstallerThread(QtCore.QThread):
             libraries = ["numpy", "pandas", "matplotlib", "requests", "flask", "pytest"]
             installed_versions = {}
 
+            total_libs = len(libraries)
+            progress_per_lib = 30 // total_libs 
+
             self.execute_command([python_path, "-m", "pip", "install", "--upgrade", "pip"], capture_output=False)
-            for lib in libraries:
+            self.increment_progress(5)  
+
+            for index, lib in enumerate(libraries, start=1):
+                self.update_signal.emit(f"Installing {lib}...")
                 self.execute_command([python_path, "-m", "pip", "install", lib], capture_output=False)
+
                 version_output = self.execute_command([python_path, "-m", "pip", "show", lib])
                 if version_output:
                     for line in version_output.split("\n"):
                         if line.startswith("Version:"):
                             installed_versions[lib] = line.split(":")[1].strip()
 
+                self.increment_progress(progress_per_lib) 
+                self.msleep(100)  
+
             summary = "\n".join([f"{pkg}: {ver}" for pkg, ver in installed_versions.items()])
             self.update_signal.emit(f"Python libraries installation completed.\nInstalled versions:\n{summary}")
+
 
     def install_vscode_extensions(self):
         code_path = self.get_command_path("code")
@@ -160,6 +197,9 @@ class InstallerThread(QtCore.QThread):
             result = self.execute_command([code_path, "--list-extensions"])
             installed_extensions = result.split("\n") if result else []
 
+            total_exts = len(extensions)
+            progress_per_ext = 20 // total_exts 
+
             installed = []
             skipped = []
 
@@ -170,12 +210,16 @@ class InstallerThread(QtCore.QThread):
                     self.execute_command([code_path, "--install-extension", ext, "--force"], capture_output=False)
                     installed.append(ext)
 
+                self.increment_progress(progress_per_ext) 
+                self.msleep(100)  
+
             summary = (
                 f"VS Code extensions installation completed.\n"
                 f"Installed: {', '.join(installed) if installed else 'None'}\n"
                 f"Already installed: {', '.join(skipped)}"
             )
             self.update_signal.emit(summary)
+
 
 
 class InstallerApp(QtWidgets.QWidget):
@@ -212,6 +256,9 @@ class InstallerApp(QtWidgets.QWidget):
         self.password_input.setPlaceholderText("System password required to install Python and VS Code")
         self.password_input.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
 
+        if platform.system() == "Windows":
+            self.password_input.setVisible(False)
+
         # Terms and Conditions
         self.terms_checkbox = QtWidgets.QCheckBox("I agree to the Terms and Conditions")
         self.terms_checkbox.stateChanged.connect(self.toggle_install_button)
@@ -229,12 +276,9 @@ class InstallerApp(QtWidgets.QWidget):
         button_layout.addWidget(self.cancel_button)
 
         # Progress Bar Layout
-        progress_layout = QtWidgets.QHBoxLayout()
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100)
-        self.progress_label = QtWidgets.QLabel("0%")
-        progress_layout.addWidget(self.progress_bar)
-        progress_layout.addWidget(self.progress_label)
+
 
         # Log Output
         self.log_output = QtWidgets.QTextEdit()
@@ -257,7 +301,7 @@ class InstallerApp(QtWidgets.QWidget):
         layout.addSpacing(10)
         layout.addWidget(self.terms_checkbox)
         layout.addLayout(button_layout)
-        layout.addLayout(progress_layout)
+        layout.addWidget(self.progress_bar)
         layout.addWidget(self.log_output)
         layout.addSpacing(10)
         layout.addWidget(self.close_button)
@@ -265,38 +309,105 @@ class InstallerApp(QtWidgets.QWidget):
         self.setLayout(layout)
 
 
+    def elevate_admin_windows(self, password):
+        try:
+            result = subprocess.run(
+                ["runas", "/user:Administrator", "cmd.exe", "/c", "echo Admin Test"],
+                input=f"{password}\n",
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            return result.returncode == 0
+        except Exception as e:
+            self.log_output.append(f"[ERROR] Windows admin elevation failed: {str(e)}")
+            return False
+
+    def elevate_admin_linux(self, password):
+        try:
+            result = subprocess.run(
+                ["sudo", "-S", "echo", "Admin Test"],
+                input=f"{password}\n",
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            return result.returncode == 0
+        except Exception as e:
+            self.log_output.append(f"[ERROR] Linux/macOS admin elevation failed: {str(e)}")
+            return False
+
+
     def toggle_install_button(self):
         self.install_button.setEnabled(self.terms_checkbox.isChecked())
 
     def start_installation(self):
+        self.log_output.clear()
+
+        if not is_connected():
+            self.log_output.append("[ERROR] No internet connection detected.\n"
+                                "Please check your connection and try again.")
+            return  
+
+        if platform.system() == "Windows" and not is_admin():
+            self.log_output.append("[INFO] Restarting with admin privileges...")
+            QtWidgets.QMessageBox.information(
+                self, "Admin Required", "The installer needs admin rights to proceed.\n"
+                                        "Click OK to restart with admin privileges.")
+
+            subprocess.run(["powershell", "Start-Process", "pysetgo.exe", "-Verb", "RunAs"])
+            QtWidgets.QApplication.quit()  
+            return
+
+        admin_password = self.password_input.text().strip()
+        if platform.system() != "Windows" and not admin_password:
+            self.log_output.append("[ERROR] Admin password is required to proceed.")
+            return
+
+        if platform.system() != "Windows":
+            success = self.elevate_admin_linux(admin_password)
+            if not success:
+                self.log_output.append("[ERROR] Failed to gain admin privileges.\n"
+                                    "Please check your password and try again.")
+                return 
+
         self.cancel_button.setVisible(True)
         self.installer_thread = InstallerThread(
             self.install_extensions_checkbox.isChecked(),
             self.install_libraries_checkbox.isChecked(),
-            self.password_input.text()
+            admin_password 
         )
         self.installer_thread.update_signal.connect(self.update_progress)
         self.installer_thread.progress_signal.connect(self.update_progress_bar)
         self.installer_thread.finished_signal.connect(self.show_completion_buttons)
         self.installer_thread.start()
-    
-    def cancel_installation(self):
-        if hasattr(self, "installer_thread") and self.installer_thread.isRunning():
-            self.installer_thread.update_signal.emit("--------------------")
-            self.installer_thread.update_signal.emit("Installation Canceled!")
-            self.installer_thread.update_signal.emit("--------------------")
-            self.installer_thread.progress_signal.emit(0)
-            
-            self.installer_thread.terminate()  
-            self.installer_thread.wait()  
 
-            self.install_button.setEnabled(True) 
-            self.cancel_button.setVisible(False)  
+    
+
+    def cancel_installation(self):
+        reply = QtWidgets.QMessageBox.question(
+            self, "Cancel Installation",
+            "Are you sure you want to cancel? This may leave incomplete installations.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            if hasattr(self, "installer_thread") and self.installer_thread.isRunning():
+                self.installer_thread.update_signal.emit("--------------------")
+                self.installer_thread.update_signal.emit("Installation Canceled!")
+                self.installer_thread.update_signal.emit("--------------------")
+                self.installer_thread.progress_signal.emit(0)
+                
+                self.installer_thread.terminate()  
+                self.installer_thread.wait()  
+
+                self.install_button.setEnabled(True) 
+                self.cancel_button.setVisible(False)  
 
 
     def update_progress_bar(self, value):
         self.progress_bar.setValue(value)
-        self.progress_label.setText(f"{value}%")
+
 
     def update_progress(self, message):
         self.log_output.append(message)
@@ -309,10 +420,10 @@ class InstallerApp(QtWidgets.QWidget):
 
 
 if __name__ == "__main__":
-    import atexit
-    import psutil 
+    import tempfile
+    
+    LOCK_FILE = os.path.join(tempfile.gettempdir(), "pysetgo.lock")
 
-    LOCK_FILE = "/tmp/pysetgo.lock"
 
     def is_pysetgo_running(pid):
         try:
