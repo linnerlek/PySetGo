@@ -29,11 +29,12 @@ class InstallerThread(QtCore.QThread):
     progress_signal = QtCore.pyqtSignal(int)
     finished_signal = QtCore.pyqtSignal()
 
-    def __init__(self, install_extensions, install_libraries, password):
+    def __init__(self, install_extensions, install_libraries, password, create_shortcut):
         super().__init__()
         self.install_extensions = install_extensions
         self.install_libraries = install_libraries
         self.password = password
+        self.create_shortcut = create_shortcut
         self.progress = 0
         self.total_steps = 100
         self.current_step = 0
@@ -78,6 +79,10 @@ class InstallerThread(QtCore.QThread):
             self.update_signal.emit("--------------------")
             self.install_vscode_extensions()
 
+        if self.create_shortcut:
+            self.update_signal.emit("--------------------")
+            self.create_vscode_shortcut()
+
 
         self.update_signal.emit("--------------------")
         self.update_signal.emit("Installation completed! You can now safely close this program.")
@@ -97,9 +102,18 @@ class InstallerThread(QtCore.QThread):
             if platform.system() == "Windows":
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW 
-            
+
+            # macOS/Linux: Add "sudo" if necessary
             if platform.system() != "Windows":
                 cmd.insert(0, "sudo")  
+
+            # Ensure we don't use stdin=subprocess.PIPE with input=
+            input_data = None
+            stdin_value = subprocess.DEVNULL
+
+            if platform.system() != "Windows":
+                input_data = f"{self.password}\n"  # Provide sudo password
+                stdin_value = None  # Avoid conflict
 
             result = subprocess.run(
                 cmd,
@@ -107,13 +121,14 @@ class InstallerThread(QtCore.QThread):
                 stderr=subprocess.PIPE if capture_output else subprocess.DEVNULL,
                 text=True,
                 check=True,
-                stdin=subprocess.PIPE if platform.system() != "Windows" else subprocess.DEVNULL,
-                input=f"{self.password}\n" if platform.system() != "Windows" else None,
-                startupinfo=startupinfo 
+                stdin=stdin_value,
+                input=input_data,  # Provide password if needed
+                startupinfo=startupinfo
             )
             return result.stdout.strip() if capture_output and result.stdout else None
         except subprocess.CalledProcessError as e:
             return f"Error: {e.stderr.strip()}" if capture_output else None
+
 
 
     def get_command_path(self, command):
@@ -220,6 +235,50 @@ class InstallerThread(QtCore.QThread):
             )
             self.update_signal.emit(summary)
 
+    def create_vscode_shortcut(self):
+        """Creates a desktop shortcut for VS Code based on OS."""
+        self.update_signal.emit("Creating VS Code desktop shortcut...")
+
+        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+
+        if platform.system() == "Windows":
+            shortcut_path = os.path.join(desktop_path, "VS Code.lnk")
+            target = self.get_command_path("code")  # Get VS Code path
+            if target:
+                import winshell
+                with winshell.shortcut(shortcut_path) as shortcut:
+                    shortcut.path = target
+                    shortcut.description = "Launch Visual Studio Code"
+            self.update_signal.emit("VS Code shortcut created on Desktop.")
+
+        elif platform.system() == "Darwin":  # macOS
+            target = "/Applications/Visual Studio Code.app"
+            shortcut_path = os.path.join(desktop_path, "Visual Studio Code")
+            if os.path.exists(target):
+                os.symlink(target, shortcut_path)
+                self.update_signal.emit("VS Code shortcut created on Desktop.")
+
+        elif platform.system() == "Linux":
+            shortcut_path = os.path.join(desktop_path, "VS Code.desktop")
+            target = self.get_command_path("code")  # Get VS Code path
+            if target:
+                shortcut_content = f"""[Desktop Entry]
+                                    Type=Application
+                                    Name=Visual Studio Code
+                                    Exec={target}
+                                    Icon=code
+                                    Terminal=false
+                                    Categories=Development;IDE;
+                                    """
+                with open(shortcut_path, "w") as f:
+                    f.write(shortcut_content)
+                os.chmod(shortcut_path, 0o755)  # Make it executable
+                self.update_signal.emit("VS Code shortcut created on Desktop.")
+
+        else:
+            self.update_signal.emit("OS not supported for shortcut creation.")
+
+
 
 
 class InstallerApp(QtWidgets.QWidget):
@@ -250,6 +309,10 @@ class InstallerApp(QtWidgets.QWidget):
         self.install_extensions_checkbox.setChecked(True)
         self.install_libraries_checkbox = QtWidgets.QCheckBox("Install Python Libraries (Recommended)")
         self.install_libraries_checkbox.setChecked(True)
+        # Checkbox for adding a desktop shortcut
+        self.create_shortcut_checkbox = QtWidgets.QCheckBox("Create a VS Code Desktop Shortcut")
+        self.create_shortcut_checkbox.setChecked(False)  # Default to checked
+
 
         # Password Input
         self.password_input = QtWidgets.QLineEdit()
@@ -275,10 +338,17 @@ class InstallerApp(QtWidgets.QWidget):
         button_layout.addWidget(self.install_button)
         button_layout.addWidget(self.cancel_button)
 
-        # Progress Bar Layout
+       # Progress Bar Layout (Updated)
+        progress_layout = QtWidgets.QHBoxLayout()  # Horizontal layout
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100)
 
+        # Add a label next to the progress bar
+        self.progress_label = QtWidgets.QLabel("0%")  # Default text at 0%
+        self.progress_label.setFixedWidth(40)  # Ensure the label doesn't resize too much
+
+        progress_layout.addWidget(self.progress_bar)  # Add progress bar
+        progress_layout.addWidget(self.progress_label)  # Add label next to it
 
         # Log Output
         self.log_output = QtWidgets.QTextEdit()
@@ -296,12 +366,13 @@ class InstallerApp(QtWidgets.QWidget):
         layout.addSpacing(20)
         layout.addWidget(self.install_extensions_checkbox)
         layout.addWidget(self.install_libraries_checkbox)
+        layout.addWidget(self.create_shortcut_checkbox)
         layout.addSpacing(10)
         layout.addWidget(self.password_input)
         layout.addSpacing(10)
         layout.addWidget(self.terms_checkbox)
         layout.addLayout(button_layout)
-        layout.addWidget(self.progress_bar)
+        layout.addLayout(progress_layout)
         layout.addWidget(self.log_output)
         layout.addSpacing(10)
         layout.addWidget(self.close_button)
@@ -344,6 +415,8 @@ class InstallerApp(QtWidgets.QWidget):
     def start_installation(self):
         self.log_output.clear()
 
+
+
         if not is_connected():
             self.log_output.append("[ERROR] No internet connection detected.\n"
                                 "Please check your connection and try again.")
@@ -371,11 +444,15 @@ class InstallerApp(QtWidgets.QWidget):
                                     "Please check your password and try again.")
                 return 
 
+        create_shortcut = self.create_shortcut_checkbox.isChecked()
+
         self.cancel_button.setVisible(True)
+
         self.installer_thread = InstallerThread(
             self.install_extensions_checkbox.isChecked(),
             self.install_libraries_checkbox.isChecked(),
-            admin_password 
+            admin_password,
+            create_shortcut
         )
         self.installer_thread.update_signal.connect(self.update_progress)
         self.installer_thread.progress_signal.connect(self.update_progress_bar)
@@ -407,6 +484,8 @@ class InstallerApp(QtWidgets.QWidget):
 
     def update_progress_bar(self, value):
         self.progress_bar.setValue(value)
+        self.progress_label.setText(f"{value}%")  # Ensure the percentage updates
+        self.progress_label.repaint()  # Force UI update on macOS
 
 
     def update_progress(self, message):
