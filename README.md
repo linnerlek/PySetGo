@@ -1,7 +1,9 @@
 # PySetGo
 
-## Overview
+
 **PySetGo** is a tool designed to streamline the installation process for educators and students, making it quick and easy to set up a Python coding environment. The goal is to eliminate the need for students to manually install Python, VS Code, extensions, and commonly used libraries—removing the need for terminal commands or additional configuration.
+
+![ScreenRecording2025-02-06at9 28 06PM-ezgif com-resize](https://github.com/user-attachments/assets/926befdb-bfea-461c-ae3e-3cbc2ac5f2fb)
 
 ## Features
 - Installs the latest version of **Python** and **VS Code**.
